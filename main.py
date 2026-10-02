@@ -1,22 +1,12 @@
+import logging
 
 from fastapi import FastAPI
-from pydantic import BaseModel
 
-from agent import run_agent
+from controllers.chat_controller import router as chat_router
+
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Internal Operations Agent")
 
-
-class ChatRequest(BaseModel):
-    message: str
-
-
-class ChatResponse(BaseModel):
-    response: str
-
-
-@app.post("/api/agent/chat")
-async def chat(request: ChatRequest):
-    response = await run_agent(request.message)
-
-    return ChatResponse(response=response)
+app.include_router(chat_router)
