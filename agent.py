@@ -5,13 +5,16 @@ from fastmcp import Client
 from jsonschema import validate
 
 from llm_client import ask_llm
-from mcp_servers.maintenance_server import mcp
+from mcp_servers.equipment_server import mcp as equipment_mcp
+from mcp_servers.maintenance_server import mcp as maintenance_mcp
 
 
 logger = logging.getLogger(__name__)
 
-# Demo policy: the agent may execute only this read-only tool.
-ALLOWED_TOOLS = {"get_maintenance_history"}
+ALLOWED_TOOLS = {
+    "get_maintenance_history",
+    "get_equipment_details",
+}
 
 
 async def run_agent(message: str) -> str:
@@ -19,23 +22,32 @@ async def run_agent(message: str) -> str:
         {"role": "user", "content": message}
     ]
 
-    # Real MCP connection using an in-memory transport.
-    async with Client(mcp) as client:
-        discovered_tools = await client.list_tools()
+    async with (
+        Client(maintenance_mcp) as maintenance_client,
+        Client(equipment_mcp) as equipment_client,
+    ):
+        tools = []
+        clients_by_tool = {}
 
-        tools = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.inputSchema,
-            }
-            for tool in discovered_tools
-            if tool.name in ALLOWED_TOOLS
-        ]
+        # Discover tools and remember which server owns each one.
+        for client in (maintenance_client, equipment_client):
+            discovered_tools = await client.list_tools()
 
-        tools_by_name = {tool["name"]: tool for tool in tools}
+            for tool in discovered_tools:
+                if tool.name not in ALLOWED_TOOLS:
+                    continue
 
-        # Bound the loop so repeated tool requests cannot run forever.
+                tools.append({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema,
+                })
+                clients_by_tool[tool.name] = client
+
+        tools_by_name = {
+            tool["name"]: tool for tool in tools
+        }
+
         for _ in range(5):
             result = await ask_llm(
                 conversation=conversation,
@@ -45,7 +57,6 @@ async def run_agent(message: str) -> str:
             if not result["tool_calls"]:
                 return result["text"]
 
-            # Preserve the assistant's tool request in the conversation.
             conversation.append({
                 "role": "assistant",
                 "content": result["text"],
@@ -53,29 +64,37 @@ async def run_agent(message: str) -> str:
             })
 
             for call in result["tool_calls"]:
-                if call["name"] not in tools_by_name:
+                tool_name = call["name"]
+
+                if tool_name not in tools_by_name:
                     raise ValueError("Tool is unavailable or disallowed.")
 
-                # Validate arguments against the schema discovered via MCP.
                 validate(
                     instance=call["arguments"],
-                    schema=tools_by_name[call["name"]]["parameters"],
+                    schema=tools_by_name[tool_name]["parameters"],
                 )
 
                 logger.info(
                     "Executing tool=%s arguments=%s",
-                    call["name"],
+                    tool_name,
                     call["arguments"],
                 )
 
+                # Route this call to the client for the correct server.
+                client = clients_by_tool[tool_name]
+
                 tool_result = await client.call_tool(
-                    name=call["name"],
+                    name=tool_name,
                     arguments=call["arguments"],
                     timeout=10,
                 )
 
+                if tool_result.is_error:
+                    raise RuntimeError(f"Tool failed: {tool_name}")
+
                 conversation.append({
                     "role": "tool",
+                    "name": tool_name,
                     "tool_call_id": call["id"],
                     "content": json.dumps(
                         tool_result.structured_content
